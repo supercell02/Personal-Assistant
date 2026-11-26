@@ -1,10 +1,15 @@
 import { Hono } from 'hono'
 import { generateText } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
+import {
+  sendMessage,
+  setWebhook,
+  verifyWebhookSecret,
+  parseUpdate,
+  type TelegramEnv,
+} from './telegram.js'
 
-type Env = {
-  TELEGRAM_BOT_TOKEN: string
-  TELEGRAM_WEBHOOK_SECRET: string
+type Env = TelegramEnv & {
   NVIDIA_API_KEY: string
 }
 
@@ -25,46 +30,30 @@ app.post('/set-webhook', async (c) => {
     return c.json({ error: 'Missing "url" in request body' }, 400)
   }
 
-  const res = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url,
-        secret_token: TELEGRAM_WEBHOOK_SECRET,
-      }),
-    }
-  )
-
-  const data = await res.json()
-  return c.json({
-    ok: data.ok,
-    result: data.result,
-    description: data.description,
+  const result = await setWebhook({
+    token: TELEGRAM_BOT_TOKEN,
+    url,
+    secretToken: TELEGRAM_WEBHOOK_SECRET,
   })
+
+  return c.json(result)
 })
 
 // Telegram webhook endpoint. Telegram POSTs updates here.
 app.post('/webhook', async (c) => {
-  const { TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, NVIDIA_API_KEY } = c.env
+  const { TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, NVIDIA_API_KEY } =
+    c.env
 
   // Verify the request originates from Telegram using the secret token.
   const secretToken = c.req.header('X-Telegram-Bot-Api-Secret-Token')
-  if (secretToken !== TELEGRAM_WEBHOOK_SECRET) {
+  if (!verifyWebhookSecret(secretToken, TELEGRAM_WEBHOOK_SECRET)) {
     return c.text('Unauthorized', 401)
   }
 
-  const update = await c.req.json<{
-    update_id?: number
-    message?: {
-      message_id?: number
-      from?: { id?: number }
-      chat?: { id?: number | string; type?: string }
-      text?: string
-      date?: number
-    }
-  }>()
+  const update = await parseUpdate(c.req.raw)
+  if (!update) {
+    return c.json({ ok: true })
+  }
 
   const message = update.message
   if (!message || !message.chat?.id || !message.text) {
@@ -80,25 +69,25 @@ app.post('/webhook', async (c) => {
   const model = openai('nvidia/nemotron-3.5-super-vl-120b-a12b')
 
   // Generate an AI response to the user's message instead of echoing.
-  const { text } = await generateText({
-    model,
-    instructions:
-      'You are a helpful assistant in a Telegram bot. Respond concisely and helpfully to the user.',
-    prompt: message.text,
-  })
+  let reply: string
+  try {
+    const { text } = await generateText({
+      model,
+      instructions:
+        'You are a helpful assistant in a Telegram bot. Respond concisely and helpfully to the user.',
+      prompt: message.text,
+    })
+    reply = text
+  } catch {
+    reply = 'Sorry, I could not generate a response right now. Please try again later.'
+  }
 
   // Send the AI-generated response back to the same chat.
-  await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: message.chat.id,
-        text,
-      }),
-    }
-  )
+  await sendMessage({
+    token: TELEGRAM_BOT_TOKEN,
+    chatId: message.chat.id,
+    text: reply,
+  })
 
   return c.json({ ok: true })
 })
